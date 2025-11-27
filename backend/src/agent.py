@@ -1,402 +1,366 @@
+# agent.py - Fraud Alert Voice Agent for Day 6
 import logging
 import os
 import json
-from typing import Optional, List, Dict, Any, Literal
+import sqlite3
+from datetime import datetime
+from typing import Optional, List, Dict, Any
 
 from dotenv import load_dotenv
 from livekit import rtc
 from livekit.agents import (
     Agent,
-    AgentServer,
     AgentSession,
     JobContext,
     JobProcess,
     RunContext,
+    cli,
     MetricsCollectedEvent,
     RoomInputOptions,
     WorkerOptions,
-    inference,
-    cli,
     metrics,
     tokenize,
-    room_io,
     function_tool,
 )
 from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-logger = logging.getLogger("agent")
+logger = logging.getLogger("fraud_agent")
 
 load_dotenv(".env.local")
 
-# ---------- Paths ---------- #
+# ---------- Database Setup ---------- #
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TUTOR_CONTENT_PATH = os.path.join(BASE_DIR, "shared-data", "day4_tutor_content.json")
-
-# ---------- Load tutor content from JSON ---------- #
-
-TUTOR_CONCEPTS: List[Dict[str, str]] = []
-TUTOR_BY_ID: Dict[str, Dict[str, str]] = {}
-TUTOR_CONTENT_STR: str = ""
-
-
-def _load_tutor_content() -> None:
-    global TUTOR_CONCEPTS, TUTOR_BY_ID, TUTOR_CONTENT_STR
-
-    if not os.path.exists(TUTOR_CONTENT_PATH):
-        raise FileNotFoundError(
-            f"Tutor content JSON not found at {TUTOR_CONTENT_PATH}. "
-            f"Create it with the concepts for Day 4."
+def init_database():
+    """Initialize SQLite database with sample fraud cases"""
+    conn = sqlite3.connect('fraud_cases.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS fraud_cases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_name TEXT NOT NULL,
+            security_identifier TEXT NOT NULL,
+            card_ending TEXT NOT NULL,
+            case_status TEXT DEFAULT 'pending_review',
+            transaction_name TEXT NOT NULL,
+            transaction_time TEXT NOT NULL,
+            transaction_category TEXT NOT NULL,
+            transaction_source TEXT NOT NULL,
+            amount REAL NOT NULL,
+            merchant_location TEXT NOT NULL,
+            security_question TEXT NOT NULL,
+            security_answer TEXT NOT NULL,
+            outcome_note TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
+    ''')
+    
+    # Insert sample fraud cases
+    sample_cases = [
+        {
+            'user_name': 'John Sharma',
+            'security_identifier': '12345',
+            'card_ending': '4242',
+            'transaction_name': 'ABC Industry',
+            'transaction_time': '2024-11-27 14:30:00',
+            'transaction_category': 'e-commerce',
+            'transaction_source': 'alibaba.com',
+            'amount': 12500.00,
+            'merchant_location': 'Shanghai, China',
+            'security_question': 'What is your mother\'s maiden name?',
+            'security_answer': 'patel'
+        },
+        {
+            'user_name': 'Priya Kumar',
+            'security_identifier': '67890',
+            'card_ending': '5678',
+            'transaction_name': 'Tech Gadgets Inc',
+            'transaction_time': '2024-11-27 16:45:00',
+            'transaction_category': 'electronics',
+            'transaction_source': 'amazon.in',
+            'amount': 8500.00,
+            'merchant_location': 'Mumbai, India',
+            'security_question': 'What was your first pet\'s name?',
+            'security_answer': 'max'
+        },
+        {
+            'user_name': 'Rahul Verma',
+            'security_identifier': '11223',
+            'card_ending': '8899',
+            'transaction_name': 'Luxury Watches',
+            'transaction_time': '2024-11-27 18:20:00',
+            'transaction_category': 'luxury_goods',
+            'transaction_source': 'swisswatches.com',
+            'amount': 45000.00,
+            'merchant_location': 'Geneva, Switzerland',
+            'security_question': 'What city were you born in?',
+            'security_answer': 'delhi'
+        }
+    ]
+    
+    for case in sample_cases:
+        cursor.execute('''
+            INSERT OR IGNORE INTO fraud_cases 
+            (user_name, security_identifier, card_ending, transaction_name, transaction_time, 
+             transaction_category, transaction_source, amount, merchant_location, security_question, security_answer)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            case['user_name'], case['security_identifier'], case['card_ending'],
+            case['transaction_name'], case['transaction_time'], case['transaction_category'],
+            case['transaction_source'], case['amount'], case['merchant_location'],
+            case['security_question'], case['security_answer']
+        ))
+    
+    conn.commit()
+    conn.close()
+    logger.info("Fraud cases database initialized")
 
-    with open(TUTOR_CONTENT_PATH, "r", encoding="utf-8") as f:
-        data = json.load(f)
+def get_fraud_case_by_user(user_name: str) -> Optional[Dict[str, Any]]:
+    """Get fraud case by user name"""
+    conn = sqlite3.connect('fraud_cases.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT * FROM fraud_cases WHERE user_name = ? AND case_status = "pending_review"', (user_name,))
+    row = cursor.fetchone()
+    
+    if row:
+        columns = [col[0] for col in cursor.description]
+        case = dict(zip(columns, row))
+        conn.close()
+        return case
+    
+    conn.close()
+    return None
 
-    if not isinstance(data, list):
-        raise ValueError("day4_tutor_content.json must be a list of concept objects.")
+def update_fraud_case(case_id: int, status: str, outcome_note: str):
+    """Update fraud case status and outcome"""
+    conn = sqlite3.connect('fraud_cases.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        UPDATE fraud_cases 
+        SET case_status = ?, outcome_note = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    ''', (status, outcome_note, case_id))
+    
+    conn.commit()
+    conn.close()
+    logger.info(f"Updated fraud case {case_id} to status: {status}")
 
-    TUTOR_CONCEPTS = []
-    for item in data:
-        if not all(k in item for k in ("id", "title", "summary", "sample_question")):
-            raise ValueError("Each concept must have id, title, summary, sample_question.")
-        TUTOR_CONCEPTS.append(
-            {
-                "id": item["id"],
-                "title": item["title"],
-                "summary": item["summary"],
-                "sample_question": item["sample_question"],
-            }
-        )
+def show_fraud_cases():
+    """Show current fraud cases status"""
+    conn = sqlite3.connect('fraud_cases.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT id, user_name, case_status, transaction_name, amount, card_ending FROM fraud_cases')
+    rows = cursor.fetchall()
+    
+    print("\n" + "="*80)
+    print("📊 CURRENT FRAUD CASES STATUS")
+    print("="*80)
+    print(f"{'ID':<3} | {'User':<12} | {'Transaction':<15} | {'Amount':<10} | {'Card':<6} | {'Status':<15}")
+    print("-" * 80)
+    
+    for row in rows:
+        print(f"{row[0]:<3} | {row[1]:<12} | {row[3]:<15} | ₹{row[4]:>7,.2f} | {row[5]:<6} | {row[2]:<15}")
+    
+    conn.close()
 
-    TUTOR_BY_ID = {c["id"]: c for c in TUTOR_CONCEPTS}
+# ---------- Murf TTS voices ---------- #
 
-    lines = []
-    for c in TUTOR_CONCEPTS:
-        lines.append(
-            f"- id: {c['id']}\n"
-            f"  title: {c['title']}\n"
-            f"  summary: {c['summary']}\n"
-            f"  sample_question: {c['sample_question']}"
-        )
-    TUTOR_CONTENT_STR = "\n".join(lines)
-
-
-def _default_concept_id() -> str:
-    return TUTOR_CONCEPTS[0]["id"] if TUTOR_CONCEPTS else "variables"
-
-
-_load_tutor_content()
-
-
-# ---------- Tutor state helpers (stored in session.userdata["tutor"]) ---------- #
-
-def _ensure_tutor_state(session) -> Dict[str, Any]:
-    ud = session.userdata
-    tutor = ud.get("tutor")
-    if not isinstance(tutor, dict):
-        tutor = {}
-        ud["tutor"] = tutor
-
-    if "mode" not in tutor:
-        tutor["mode"] = "welcome"
-    if "concept_id" not in tutor:
-        tutor["concept_id"] = _default_concept_id()
-
-    return tutor
-
-
-def _set_tutor_mode(session, mode: str, concept_id: Optional[str] = None) -> Dict[str, Any]:
-    tutor = _ensure_tutor_state(session)
-    tutor["mode"] = mode
-    if concept_id is not None:
-        if concept_id in TUTOR_BY_ID:
-            tutor["concept_id"] = concept_id
-        else:
-            tutor["concept_id"] = _default_concept_id()
-    return tutor
-
-
-def _set_tutor_concept(session, concept_id: str) -> Dict[str, Any]:
-    tutor = _ensure_tutor_state(session)
-    if concept_id in TUTOR_BY_ID:
-        tutor["concept_id"] = concept_id
-    else:
-        tutor["concept_id"] = _default_concept_id()
-    return tutor
-
-
-def _get_active_concept(session) -> Dict[str, str]:
-    tutor = _ensure_tutor_state(session)
-    cid = tutor.get("concept_id") or _default_concept_id()
-    return TUTOR_BY_ID.get(cid, TUTOR_CONCEPTS[0])
-
-
-# ---------- Murf Falcon TTS voices ---------- #
-# NOTE: If your actual Murf voice IDs differ, just change the `voice=` strings.
-
-TTS_MATTHEW = murf.TTS(
-    voice="en-US-matthew",  # Learn mode voice
-    style="Conversation",
+TTS_FRAUD_AGENT = murf.TTS(
+    voice="en-US-matthew",
+    style="Professional",
     tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
     text_pacing=True,
 )
 
-TTS_ALICIA = murf.TTS(
-    voice="en-US-alicia",  # Quiz mode voice
-    style="Conversation",
-    tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-    text_pacing=True,
-)
+# ---------- Fraud Alert Agent ---------- #
 
-TTS_KEN = murf.TTS(
-    voice="en-US-ken",  # Teach-back mode voice
-    style="Conversation",
-    tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-    text_pacing=True,
-)
-
-TTS_ROUTER = TTS_MATTHEW  # router / greeting voice
-
-
-# ---------- Base tutor agent with tools ---------- #
-
-class BaseTutorAgent(Agent):
+class FraudAlertAgent(Agent):
     """
-    Shared logic for the three modes + router.
-    Handles:
-      - access to JSON content
-      - tools: switch_mode, set_concept
+    Fraud Alert Voice Agent for Bank Security
     """
 
-    def __init__(
-        self,
-        mode: Literal["welcome", "learn", "quiz", "teach_back"],
-        *,
-        tts,
-        extra_mode_instructions: str = "",
-        **kwargs,
-    ) -> None:
-        base_instructions = f"""
-You are part of a multi-agent **Teach-the-Tutor: Active Recall Coach**.
+    def __init__(self, **kwargs):
+        instructions = """
+You are a professional and reassuring Fraud Alert Agent for SecureBank India.
 
-There are three learning modes:
-- learn      → explain a concept clearly using the JSON content.
-- quiz       → ask short questions and give feedback.
-- teach_back → the user explains the concept back, you give qualitative feedback.
+YOUR ROLE:
+1. Introduce yourself clearly as a fraud detection representative from SecureBank
+2. Explain that you're calling about a suspicious transaction for security verification
+3. Ask for the customer's name to locate their fraud case
+4. Perform basic security verification using pre-defined questions
+5. Read out the suspicious transaction details clearly
+6. Ask if they recognize and authorized this transaction
+7. Take appropriate action based on their response
+8. End the call professionally with clear next steps
 
-Course content (DO NOT invent new concepts; only use these):
+SECURITY GUIDELINES:
+- NEVER ask for full card numbers, PINs, passwords, or sensitive credentials
+- Use only pre-defined security questions from the database
+- Speak in a calm, professional, and reassuring manner
+- If verification fails, politely end the call without proceeding
+- Always confirm transaction details before taking action
 
-{TUTOR_CONTENT_STR}
+CALL FLOW:
+1. Greeting and introduction
+2. Ask for customer name to find their case
+3. Security verification question
+4. Transaction details reading
+5. Transaction confirmation (yes/no)
+6. Action and resolution
+7. Call conclusion
 
-General rules:
-- Always focus on ONE concept at a time.
-- Respect the active concept from state unless the user explicitly asks to switch.
-- Keep responses short and conversational, 1 main idea per turn.
-- If the user asks to "learn", "quiz me", "let me teach it back", or "switch to X",
-  then call the `switch_mode` tool.
-- If the user names a specific concept (e.g. 'variables', 'loops'), call `set_concept`.
-
-Current mode: {mode}
-
-Mode-specific behavior:
-{extra_mode_instructions}
+IMPORTANT: When verifying security answers, be flexible with user input. 
+Accept answers in any case (upper/lower) and be tolerant of minor variations.
 """
-        super().__init__(instructions=base_instructions, tts=tts, **kwargs)
+        super().__init__(instructions=instructions, tts=TTS_FRAUD_AGENT, **kwargs)
 
-    # ---------------- TOOLS (shared in all modes) ---------------- #
+    async def on_enter(self) -> None:
+        # Start with professional greeting
+        await self.session.generate_reply(
+            instructions=(
+                "Greet the customer professionally as a fraud detection representative from SecureBank India. "
+                "Explain that this is a security call regarding a suspicious transaction. "
+                "Ask for their full name to locate their case in our system."
+            )
+        )
+
+    # ---------- Fraud Detection Tools ---------- #
 
     @function_tool()
-    async def switch_mode(
-        self,
-        context: RunContext,
-        mode: Literal["learn", "quiz", "teach_back"],
-        concept_id: Optional[str] = None,
-    ):
-        """
-        Switch between learn, quiz, and teach_back modes.
-        Use this whenever the user asks to change modes.
-        """
-
+    async def find_fraud_case(self, context: RunContext, user_name: str) -> str:
+        """Find fraud case by user name"""
         session = context.session
-        tutor = _ensure_tutor_state(session)
-
-        # Decide which concept to use
-        if concept_id is None:
-            concept_id = tutor.get("concept_id") or _default_concept_id()
-
-        if concept_id not in TUTOR_BY_ID:
-            concept_id = _default_concept_id()
-
-        # Update state
-        _set_tutor_mode(session, mode, concept_id)
-
-        # Decide new agent
-        if mode == "learn":
-            new_agent = LearnAgent()
-        elif mode == "quiz":
-            new_agent = QuizAgent()
+        fraud_state = _ensure_fraud_state(session)
+        
+        case = get_fraud_case_by_user(user_name)
+        if case:
+            fraud_state["current_case"] = case
+            fraud_state["collected_fields"].add("user_name")
+            
+            return (f"Thank you {user_name}. I found a suspicious transaction in our system. "
+                    f"For security verification, please answer this question: {case['security_question']}")
         else:
-            new_agent = TeachBackAgent()
-
-        # Return BOTH the new agent (handoff) and a small textual result
-        # (the text is visible to the LLM, the agent handoff is handled by LiveKit)
-        return new_agent, f"Switching to {mode} mode for concept '{concept_id}'."
-
+            return (f"I'm sorry, I couldn't find any pending fraud cases for {user_name}. "
+                    "This might be a mistake, or the case might have been resolved already. "
+                    "Please contact our customer service for further assistance.")
 
     @function_tool()
-    async def set_concept(
-        self,
-        context: RunContext,
-        concept_id: str,
-    ) -> str:
-        """
-        Set the active concept by id ('variables', 'loops', etc.).
-        Call when the user explicitly asks for a concept.
-        """
+    async def verify_security_answer(self, context: RunContext, answer: str) -> str:
+        """Verify security question answer"""
         session = context.session
-        if concept_id not in TUTOR_BY_ID:
-            valid = ", ".join(TUTOR_BY_ID.keys())
-            return f"Unknown concept id '{concept_id}'. Valid ids: {valid}."
-
-        _set_tutor_concept(session, concept_id)
-        return f"Great, we'll focus on '{concept_id}' now."
-
-
-# ---------- Router agent (entrypoint) ---------- #
-
-class RouterAgent(BaseTutorAgent):
-    """
-    First agent the user meets.
-    Greets, explains modes, asks what they want, then hands off.
-    """
-
-    def __init__(self, **kwargs):
-        super().__init__(
-            mode="welcome",
-            tts=TTS_ROUTER,
-            extra_mode_instructions="""
-- Greet the learner.
-- Briefly describe the three modes: learn, quiz, teach_back.
-- Ask which mode they want to start with and which concept (e.g. 'variables' or 'loops').
-- After they reply, call `switch_mode` with their chosen mode and concept_id.
-- Once you call `switch_mode`, you don't continue talking; the new agent takes over.
-""",
-            **kwargs,
-        )
-
-    async def on_enter(self) -> None:
-        # Kick off the greeting turn
-        await self.session.generate_reply(
-            instructions=(
-                "Greet the learner. Explain that you have three modes: "
-                "learn (I explain), quiz (I question you), and teach_back (you explain). "
-                "Ask: which mode do you want to start with, and which concept — "
-                "variables or loops?"
+        fraud_state = _ensure_fraud_state(session)
+        case = fraud_state.get("current_case")
+        
+        if not case:
+            return "I don't have an active case to verify. Please start by providing your name."
+        
+        # Normalize both answers for comparison
+        user_answer = answer.lower().strip()
+        correct_answer = case['security_answer'].lower().strip()
+        
+        logger.info(f"Security verification: User said '{user_answer}', expected '{correct_answer}'")
+        
+        # Flexible matching - check if user answer contains the correct answer or vice versa
+        if (user_answer == correct_answer or 
+            correct_answer in user_answer or 
+            user_answer in correct_answer):
+            
+            fraud_state["verified"] = True
+            fraud_state["collected_fields"].add("security_verified")
+            
+            # Read transaction details
+            transaction_details = (
+                f"I'm seeing a transaction of ₹{case['amount']:,.2f} at {case['transaction_name']} "
+                f"through {case['transaction_source']} on {case['transaction_time']}. "
+                f"The transaction was categorized as {case['transaction_category']} and originated from {case['merchant_location']}. "
+                f"This was charged to your card ending with {case['card_ending']}. "
+                "Did you authorize this transaction?"
             )
-        )
+            return transaction_details
+        else:
+            fraud_state["verified"] = False
+            return ("I'm sorry, that answer doesn't match our records. For security reasons, "
+                    "I cannot proceed with this verification. Please contact our customer service "
+                    "directly for assistance with any suspicious transactions.")
 
-
-# ---------- Learn mode agent (Matthew) ---------- #
-
-class LearnAgent(BaseTutorAgent):
-    def __init__(self, **kwargs):
-        super().__init__(
-            mode="learn",
-            tts=TTS_MATTHEW,
-            extra_mode_instructions="""
-In learn mode:
-- Focus on the active concept from state.
-- Use that concept's `summary` as the backbone of your explanation.
-- Explain in clear, friendly language with 1–2 short, concrete examples.
-- After a short explanation, ask something like:
-  - "Want me to quiz you on this?"
-  - "Should we switch to teach-back so you explain it to me?"
-""",
-            **kwargs,
-        )
-
-    async def on_enter(self) -> None:
-        concept = _get_active_concept(self.session)
-        await self.session.generate_reply(
-            instructions=(
-                "Introduce yourself as the Learn mode tutor using Matthew's voice. "
-                f"Tell the learner you'll start with the concept '{concept['title']}'. "
-                "Give a short, high-level explanation of the concept and ask if "
-                "they want more detail or would like to be quizzed."
+    @function_tool()
+    async def confirm_transaction(self, context: RunContext, confirmed: bool) -> str:
+        """Handle transaction confirmation"""
+        session = context.session
+        fraud_state = _ensure_fraud_state(session)
+        case = fraud_state.get("current_case")
+        
+        if not case or not fraud_state.get("verified"):
+            return "We need to complete security verification before discussing transaction details."
+        
+        if confirmed:
+            # Mark as safe
+            update_fraud_case(
+                case['id'], 
+                'confirmed_safe', 
+                'Customer confirmed transaction as legitimate during verification call'
             )
-        )
-
-
-# ---------- Quiz mode agent (Alicia) ---------- #
-
-class QuizAgent(BaseTutorAgent):
-    def __init__(self, **kwargs):
-        super().__init__(
-            mode="quiz",
-            tts=TTS_ALICIA,
-            extra_mode_instructions="""
-In quiz mode:
-- Ask ONE short question at a time, based on the concept's `sample_question`
-  and small variations of it.
-- Wait for the user's answer before giving feedback.
-- Feedback should be brief: what they got right, what they missed.
-- Then either:
-  - ask a follow-up question, or
-  - suggest switching to teach_back or learn if they seem unsure.
-""",
-            **kwargs,
-        )
-
-    async def on_enter(self) -> None:
-        concept = _get_active_concept(self.session)
-        await self.session.generate_reply(
-            instructions=(
-                "Introduce yourself as the Quiz mode tutor using Alicia's voice. "
-                f"Confirm you're quizzing them on '{concept['title']}'. "
-                "Ask one short question based on the concept's sample_question, "
-                "and wait for their answer."
+            return ("Thank you for confirming this transaction. I'll mark this as verified and safe in our system. "
+                    "No further action is needed. Thank you for your time and for helping us keep your account secure.")
+        else:
+            # Mark as fraudulent
+            update_fraud_case(
+                case['id'],
+                'confirmed_fraud',
+                'Customer denied authorizing this transaction - fraud confirmed'
             )
-        )
+            return (f"I understand this transaction is not authorized. I'm immediately blocking your card "
+                    f"ending with {case['card_ending']} to prevent any further unauthorized transactions. "
+                    f"A new card will be dispatched to your registered address within 2-3 business days. "
+                    f"We've also initiated a dispute process for the fraudulent amount of ₹{case['amount']:,.2f}. "
+                    f"Our fraud team will contact you within 24 hours with further updates. "
+                    f"Thank you for your prompt response in securing your account.")
 
-
-# ---------- Teach-back mode agent (Ken) ---------- #
-
-class TeachBackAgent(BaseTutorAgent):
-    def __init__(self, **kwargs):
-        super().__init__(
-            mode="teach_back",
-            tts=TTS_KEN,
-            extra_mode_instructions="""
-In teach_back mode:
-- Ask the learner to explain the concept in their own words.
-- Let them finish before responding.
-- Give 1–3 sentences of qualitative feedback:
-  - What they explained well.
-  - What they missed or could clarify.
-- Optionally suggest whether they should:
-  - go back to learn for more explanation, or
-  - keep quizzing.
-""",
-            **kwargs,
-        )
-
-    async def on_enter(self) -> None:
-        concept = _get_active_concept(self.session)
-        await self.session.generate_reply(
-            instructions=(
-                "Introduce yourself as the MurfLearn coach using Ken's voice. "
-                f"Ask the learner to explain '{concept['title']}' in their own words. "
-                "Encourage them to cover the main idea and at least one example."
+    @function_tool()
+    async def end_verification_call(self, context: RunContext) -> str:
+        """End the verification call"""
+        session = context.session
+        fraud_state = _ensure_fraud_state(session)
+        case = fraud_state.get("current_case")
+        
+        if case and not fraud_state.get("verified"):
+            update_fraud_case(
+                case['id'],
+                'verification_failed',
+                'Security verification failed during fraud alert call'
             )
-        )
+        
+        return ("Thank you for your time. If you have any concerns about your account security, "
+                "please contact our 24/7 customer service helpline. Have a secure day.")
 
+# ---------- Fraud state helpers ---------- #
 
-# ---------- Prewarm (VAD) ---------- #
+def _ensure_fraud_state(session) -> Dict[str, Any]:
+    """Ensure fraud state exists in session userdata"""
+    ud = session.userdata
+    fraud = ud.get("fraud")
+    if not isinstance(fraud, dict):
+        fraud = {
+            "current_case": None,
+            "verified": False,
+            "collected_fields": set()
+        }
+        ud["fraud"] = fraud
+    return fraud
+
+# ---------- Prewarm ---------- #
 
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
-
+    # Initialize database on prewarm
+    init_database()
+    # Show initial database state
+    show_fraud_cases()
 
 # ---------- Entrypoint ---------- #
 
@@ -411,14 +375,13 @@ async def entrypoint(ctx: JobContext):
         llm=google.LLM(
             model="gemini-2.5-flash",
         ),
-        # Default TTS (router / fallback) – individual agents override this
-        tts=TTS_MATTHEW,
+        tts=TTS_FRAUD_AGENT,
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,
     )
 
-    # Initialize userdata; tutor state lives under session.userdata["tutor"]
+    # Initialize userdata; fraud state lives under session.userdata["fraud"]
     session.userdata = {}
 
     usage_collector = metrics.UsageCollector()
@@ -434,9 +397,9 @@ async def entrypoint(ctx: JobContext):
 
     ctx.add_shutdown_callback(log_usage)
 
-    # Start with RouterAgent → it will hand off to learn/quiz/teach_back
+    # Start with Fraud Alert Agent
     await session.start(
-        agent=RouterAgent(),
+        agent=FraudAlertAgent(),
         room=ctx.room,
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVC(),
@@ -444,7 +407,6 @@ async def entrypoint(ctx: JobContext):
     )
 
     await ctx.connect()
-
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
