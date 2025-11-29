@@ -1,402 +1,354 @@
+
+# agent.py - Voice Game Master (D&D-Style Adventure) for Day 8
 import logging
 import os
 import json
-from typing import Optional, List, Dict, Any, Literal
+import random
+from datetime import datetime
+from typing import Optional, List, Dict, Any
 
 from dotenv import load_dotenv
 from livekit import rtc
 from livekit.agents import (
     Agent,
-    AgentServer,
     AgentSession,
     JobContext,
     JobProcess,
     RunContext,
+    cli,
     MetricsCollectedEvent,
     RoomInputOptions,
     WorkerOptions,
-    inference,
-    cli,
     metrics,
     tokenize,
-    room_io,
     function_tool,
 )
 from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-logger = logging.getLogger("agent")
+logger = logging.getLogger("game_master")
 
 load_dotenv(".env.local")
 
-# ---------- Paths ---------- #
+# ---------- Game Universes & World Templates ---------- #
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TUTOR_CONTENT_PATH = os.path.join(BASE_DIR, "shared-data", "day4_tutor_content.json")
+GAME_UNIVERSES = {
+    "fantasy": {
+        "name": "Fantasy Realm",
+        "system_prompt": """You are a wise and dramatic Fantasy Game Master in a world of dragons, magic, and ancient kingdoms.
 
-# ---------- Load tutor content from JSON ---------- #
+UNIVERSE: The realm of Eldoria, where magic flows through the land and ancient prophecies guide destinies.
 
-TUTOR_CONCEPTS: List[Dict[str, str]] = []
-TUTOR_BY_ID: Dict[str, Dict[str, str]] = {}
-TUTOR_CONTENT_STR: str = ""
+YOUR ROLE:
+- Describe vivid scenes with rich sensory details (sights, sounds, smells)
+- Create compelling NPCs with distinct personalities
+- Present meaningful choices that affect the story
+- Build tension and drama through your narration
+- End each message with a clear choice or question: "What do you do?"
 
+STORY ARC: The player is a young adventurer who discovers an ancient artifact that holds the key to saving the kingdom from an ancient evil.
 
-def _load_tutor_content() -> None:
-    global TUTOR_CONCEPTS, TUTOR_BY_ID, TUTOR_CONTENT_STR
+GAME MASTER GUIDELINES:
+- Always maintain continuity with previous events
+- Remember NPC names, locations, and player decisions
+- Incorporate player choices into the evolving narrative
+- Provide 2-3 clear options when presenting choices
+- Use descriptive language that immerses the player
+- Balance combat, exploration, and roleplaying
+- Make the player feel their decisions matter""",
+        "initial_world": {
+            "player": {
+                "name": "Adventurer",
+                "health": 100,
+                "max_health": 100,
+                "inventory": ["rusty sword", "leather armor", "healing potion"],
+                "gold": 50,
+                "level": 1,
+                "location": "Whispering Woods"
+            },
+            "npcs": {
+                "elder_merlin": {"name": "Elder Merlin", "attitude": "friendly", "alive": True},
+                "dragon_ignis": {"name": "Ignis the Dragon", "attitude": "hostile", "alive": True}
+            },
+            "locations": {
+                "whispering_woods": {"name": "Whispering Woods", "visited": True},
+                "stonehaven_keep": {"name": "Stonehaven Keep", "visited": False},
+                "crystal_caverns": {"name": "Crystal Caverns", "visited": False}
+            },
+            "quests": {
+                "main": {"name": "The Crystal of Eldoria", "status": "active", "progress": 0},
+                "side": {"name": "Help the Village", "status": "available", "progress": 0}
+            },
+            "events": ["arrived_in_whispering_woods"]
+        }
+    },
+    "sci_fi": {
+        "name": "Cyberpunk City", 
+        "system_prompt": """You are a gritty Cyberpunk Game Master in the neon-drenched metropolis of Neo-Tokyo 2088.
 
-    if not os.path.exists(TUTOR_CONTENT_PATH):
-        raise FileNotFoundError(
-            f"Tutor content JSON not found at {TUTOR_CONTENT_PATH}. "
-            f"Create it with the concepts for Day 4."
+UNIVERSE: A dystopian future where mega-corporations rule, cyber-enhancements are common, and hackers fight for freedom.
+
+YOUR ROLE:
+- Describe the cyberpunk world with neon lights, rain-slicked streets, and high-tech gadgets
+- Create morally ambiguous characters and situations
+- Present choices that test the player's ethics and survival instincts
+- Build tension through corporate conspiracies and technological threats
+- End each message with: "What's your move, runner?"
+
+STORY ARC: The player is a freelance hacker who uncovers a corporate plot that could enslave humanity.
+
+GAME MASTER GUIDELINES:
+- Maintain the cyberpunk aesthetic throughout descriptions
+- Remember the player's cyberware, contacts, and reputation
+- Incorporate high-tech elements and hacking opportunities
+- Present dilemmas between profit and principles
+- Use tech jargon appropriately but explain when needed"""
+    },
+    "space": {
+        "name": "Space Opera",
+        "system_prompt": """You are an epic Space Opera Game Master navigating the vast reaches of the Galactic Federation.
+
+UNIVERSE: A universe of alien civilizations, star empires, and ancient cosmic mysteries.
+
+YOUR ROLE:
+- Describe alien worlds, star systems, and futuristic technology
+- Create diverse alien species with unique cultures
+- Present interstellar politics and cosmic threats
+- Build epic space battles and first contact scenarios
+- End each message with: "What's your course of action, Captain?"
+
+STORY ARC: The player commands a starship and must unite warring factions against an extragalactic invasion.
+
+GAME MASTER GUIDELINES:
+- Maintain the scale and wonder of space exploration
+- Remember alien species, political alliances, and star systems
+- Incorporate zero-gravity and space travel elements
+- Present choices that affect interstellar relations
+- Balance scientific accuracy with dramatic storytelling"""
+    }
+}
+
+# ---------- Murf TTS voices ---------- #
+
+TTS_GAME_MASTER = murf.TTS(
+    voice="en-US-matthew",
+    style="Story",
+    tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
+    text_pacing=True,
+)
+
+# ---------- Game Master Agent ---------- #
+
+class GameMasterAgent(Agent):
+    """
+    D&D-Style Voice Game Master for Interactive Adventures
+    """
+
+    def __init__(self, universe: str = "fantasy", **kwargs):
+        self.universe = universe
+        universe_config = GAME_UNIVERSES[universe]
+        
+        super().__init__(
+            instructions=universe_config["system_prompt"],
+            tts=TTS_GAME_MASTER,
+            **kwargs
         )
 
-    with open(TUTOR_CONTENT_PATH, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    if not isinstance(data, list):
-        raise ValueError("day4_tutor_content.json must be a list of concept objects.")
-
-    TUTOR_CONCEPTS = []
-    for item in data:
-        if not all(k in item for k in ("id", "title", "summary", "sample_question")):
-            raise ValueError("Each concept must have id, title, summary, sample_question.")
-        TUTOR_CONCEPTS.append(
-            {
-                "id": item["id"],
-                "title": item["title"],
-                "summary": item["summary"],
-                "sample_question": item["sample_question"],
-            }
+    async def on_enter(self) -> None:
+        # Initialize game state
+        game_state = _ensure_game_state(self.session)
+        universe_config = GAME_UNIVERSES[self.universe]
+        
+        if "initial_world" in universe_config:
+            game_state["world"] = universe_config["initial_world"].copy()
+        
+        # Start the adventure
+        await self.session.generate_reply(
+            instructions=(
+                "Begin the adventure with an immersive opening scene that introduces the setting, "
+                "establishes the initial conflict, and presents the player with their first meaningful choice. "
+                "Describe the environment vividly and end by asking what the player wants to do."
+            )
         )
 
-    TUTOR_BY_ID = {c["id"]: c for c in TUTOR_CONCEPTS}
+    # ---------- Game Mechanics Tools ---------- #
 
-    lines = []
-    for c in TUTOR_CONCEPTS:
-        lines.append(
-            f"- id: {c['id']}\n"
-            f"  title: {c['title']}\n"
-            f"  summary: {c['summary']}\n"
-            f"  sample_question: {c['sample_question']}"
-        )
-    TUTOR_CONTENT_STR = "\n".join(lines)
+    @function_tool()
+    async def roll_dice(self, context: RunContext, sides: int = 20, modifier: int = 0) -> str:
+        """Roll dice for game mechanics - used for skill checks, combat, and random events"""
+        roll = random.randint(1, sides)
+        total = roll + modifier
+        
+        logger.info(f"Dice roll: {roll} (d{sides}) + {modifier} = {total}")
+        
+        # Determine success level
+        if roll == 1:
+            outcome = "CRITICAL FAILURE"
+        elif roll == 20:
+            outcome = "CRITICAL SUCCESS" 
+        elif total >= 15:
+            outcome = "SUCCESS"
+        elif total >= 10:
+            outcome = "PARTIAL SUCCESS"
+        else:
+            outcome = "FAILURE"
+            
+        return f"🎲 Roll: {roll} (d{sides}) + {modifier} = {total} - {outcome}"
 
+    @function_tool()
+    async def update_player_stats(self, context: RunContext, 
+                                health_change: int = 0,
+                                gold_change: int = 0,
+                                add_item: str = "",
+                                remove_item: str = "") -> str:
+        """Update player character statistics and inventory"""
+        session = context.session
+        game_state = _ensure_game_state(session)
+        
+        player = game_state["world"]["player"]
+        
+        # Update health
+        if health_change != 0:
+            player["health"] = max(0, min(player["max_health"], player["health"] + health_change))
+            
+        # Update gold
+        if gold_change != 0:
+            player["gold"] = max(0, player["gold"] + gold_change)
+            
+        # Add item
+        if add_item and add_item not in player["inventory"]:
+            player["inventory"].append(add_item)
+            
+        # Remove item
+        if remove_item and remove_item in player["inventory"]:
+            player["inventory"].remove(remove_item)
+            
+        return f"Player stats updated. Health: {player['health']}, Gold: {player['gold']}, Items: {len(player['inventory'])}"
 
-def _default_concept_id() -> str:
-    return TUTOR_CONCEPTS[0]["id"] if TUTOR_CONCEPTS else "variables"
+    @function_tool()
+    async def check_inventory(self, context: RunContext) -> str:
+        """Check player's current inventory and stats"""
+        session = context.session
+        game_state = _ensure_game_state(session)
+        
+        player = game_state["world"]["player"]
+        
+        inventory_text = ", ".join(player["inventory"]) if player["inventory"] else "Empty"
+        
+        return (f"🧙‍♂️ Character Sheet:\n"
+                f"Health: {player['health']}/{player['max_health']} ❤️\n"
+                f"Gold: {player['gold']} 🪙\n"
+                f"Level: {player['level']} ⭐\n"
+                f"Location: {player['location']} 🗺️\n"
+                f"Inventory: {inventory_text}")
 
+    @function_tool()
+    async def add_game_event(self, context: RunContext, event: str) -> str:
+        """Record a significant game event that affects the story"""
+        session = context.session
+        game_state = _ensure_game_state(session)
+        
+        if "events" not in game_state["world"]:
+            game_state["world"]["events"] = []
+            
+        game_state["world"]["events"].append(event)
+        logger.info(f"Game event recorded: {event}")
+        
+        return f"Event '{event}' added to game history."
 
-_load_tutor_content()
+    @function_tool()
+    async def change_location(self, context: RunContext, new_location: str) -> str:
+        """Move player to a new location in the game world"""
+        session = context.session
+        game_state = _ensure_game_state(session)
+        
+        old_location = game_state["world"]["player"]["location"]
+        game_state["world"]["player"]["location"] = new_location
+        
+        # Mark location as visited
+        for loc_key, loc_data in game_state["world"]["locations"].items():
+            if loc_data["name"] == new_location:
+                loc_data["visited"] = True
+                
+        return f"Player moved from {old_location} to {new_location}."
 
+    @function_tool()
+    async def save_game(self, context: RunContext) -> str:
+        """Save current game state to a JSON file"""
+        session = context.session
+        game_state = _ensure_game_state(session)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"game_save_{timestamp}.json"
+        
+        save_data = {
+            "timestamp": datetime.now().isoformat(),
+            "universe": self.universe,
+            "world_state": game_state["world"],
+            "summary": f"Adventure in {GAME_UNIVERSES[self.universe]['name']}"
+        }
+        
+        with open(filename, 'w') as f:
+            json.dump(save_data, f, indent=2)
+            
+        logger.info(f"Game saved to {filename}")
+        return f"Game saved successfully! File: {filename}"
 
-# ---------- Tutor state helpers (stored in session.userdata["tutor"]) ---------- #
+    @function_tool()
+    async def combat_round(self, context: RunContext, enemy: str, enemy_health: int) -> str:
+        """Execute a combat round against an enemy"""
+        session = context.session
+        game_state = _ensure_game_state(session)
+        
+        # Player attack
+        player_roll = random.randint(1, 20)
+        player_damage = random.randint(5, 15)
+        
+        # Enemy attack
+        enemy_roll = random.randint(1, 20)
+        enemy_damage = random.randint(3, 12)
+        
+        result = f"⚔️ COMBAT ROUND vs {enemy}:\n"
+        result += f"Player attacks: {player_roll} (d20) - "
+        
+        if player_roll >= 12:
+            result += f"HIT! {enemy} takes {player_damage} damage!\n"
+            enemy_health -= player_damage
+        else:
+            result += "MISS!\n"
+            
+        result += f"{enemy} attacks: {enemy_roll} (d20) - "
+        
+        if enemy_roll >= 10:
+            result += f"HIT! You take {enemy_damage} damage!\n"
+            game_state["world"]["player"]["health"] -= enemy_damage
+        else:
+            result += "MISS!\n"
+            
+        result += f"Your health: {game_state['world']['player']['health']}\n"
+        result += f"{enemy} health: {max(0, enemy_health)}"
+        
+        return result
 
-def _ensure_tutor_state(session) -> Dict[str, Any]:
+# ---------- Game State Helpers ---------- #
+
+def _ensure_game_state(session) -> Dict[str, Any]:
+    """Ensure game state exists in session userdata"""
     ud = session.userdata
-    tutor = ud.get("tutor")
-    if not isinstance(tutor, dict):
-        tutor = {}
-        ud["tutor"] = tutor
+    game = ud.get("game")
+    if not isinstance(game, dict):
+        game = {
+            "world": {},
+            "turn_count": 0,
+            "active_quests": []
+        }
+        ud["game"] = game
+    return game
 
-    if "mode" not in tutor:
-        tutor["mode"] = "welcome"
-    if "concept_id" not in tutor:
-        tutor["concept_id"] = _default_concept_id()
-
-    return tutor
-
-
-def _set_tutor_mode(session, mode: str, concept_id: Optional[str] = None) -> Dict[str, Any]:
-    tutor = _ensure_tutor_state(session)
-    tutor["mode"] = mode
-    if concept_id is not None:
-        if concept_id in TUTOR_BY_ID:
-            tutor["concept_id"] = concept_id
-        else:
-            tutor["concept_id"] = _default_concept_id()
-    return tutor
-
-
-def _set_tutor_concept(session, concept_id: str) -> Dict[str, Any]:
-    tutor = _ensure_tutor_state(session)
-    if concept_id in TUTOR_BY_ID:
-        tutor["concept_id"] = concept_id
-    else:
-        tutor["concept_id"] = _default_concept_id()
-    return tutor
-
-
-def _get_active_concept(session) -> Dict[str, str]:
-    tutor = _ensure_tutor_state(session)
-    cid = tutor.get("concept_id") or _default_concept_id()
-    return TUTOR_BY_ID.get(cid, TUTOR_CONCEPTS[0])
-
-
-# ---------- Murf Falcon TTS voices ---------- #
-# NOTE: If your actual Murf voice IDs differ, just change the `voice=` strings.
-
-TTS_MATTHEW = murf.TTS(
-    voice="en-US-matthew",  # Learn mode voice
-    style="Conversation",
-    tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-    text_pacing=True,
-)
-
-TTS_ALICIA = murf.TTS(
-    voice="en-US-alicia",  # Quiz mode voice
-    style="Conversation",
-    tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-    text_pacing=True,
-)
-
-TTS_KEN = murf.TTS(
-    voice="en-US-ken",  # Teach-back mode voice
-    style="Conversation",
-    tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
-    text_pacing=True,
-)
-
-TTS_ROUTER = TTS_MATTHEW  # router / greeting voice
-
-
-# ---------- Base tutor agent with tools ---------- #
-
-class BaseTutorAgent(Agent):
-    """
-    Shared logic for the three modes + router.
-    Handles:
-      - access to JSON content
-      - tools: switch_mode, set_concept
-    """
-
-    def __init__(
-        self,
-        mode: Literal["welcome", "learn", "quiz", "teach_back"],
-        *,
-        tts,
-        extra_mode_instructions: str = "",
-        **kwargs,
-    ) -> None:
-        base_instructions = f"""
-You are part of a multi-agent **Teach-the-Tutor: Active Recall Coach**.
-
-There are three learning modes:
-- learn      → explain a concept clearly using the JSON content.
-- quiz       → ask short questions and give feedback.
-- teach_back → the user explains the concept back, you give qualitative feedback.
-
-Course content (DO NOT invent new concepts; only use these):
-
-{TUTOR_CONTENT_STR}
-
-General rules:
-- Always focus on ONE concept at a time.
-- Respect the active concept from state unless the user explicitly asks to switch.
-- Keep responses short and conversational, 1 main idea per turn.
-- If the user asks to "learn", "quiz me", "let me teach it back", or "switch to X",
-  then call the `switch_mode` tool.
-- If the user names a specific concept (e.g. 'variables', 'loops'), call `set_concept`.
-
-Current mode: {mode}
-
-Mode-specific behavior:
-{extra_mode_instructions}
-"""
-        super().__init__(instructions=base_instructions, tts=tts, **kwargs)
-
-    # ---------------- TOOLS (shared in all modes) ---------------- #
-
-    @function_tool()
-    async def switch_mode(
-        self,
-        context: RunContext,
-        mode: Literal["learn", "quiz", "teach_back"],
-        concept_id: Optional[str] = None,
-    ):
-        """
-        Switch between learn, quiz, and teach_back modes.
-        Use this whenever the user asks to change modes.
-        """
-
-        session = context.session
-        tutor = _ensure_tutor_state(session)
-
-        # Decide which concept to use
-        if concept_id is None:
-            concept_id = tutor.get("concept_id") or _default_concept_id()
-
-        if concept_id not in TUTOR_BY_ID:
-            concept_id = _default_concept_id()
-
-        # Update state
-        _set_tutor_mode(session, mode, concept_id)
-
-        # Decide new agent
-        if mode == "learn":
-            new_agent = LearnAgent()
-        elif mode == "quiz":
-            new_agent = QuizAgent()
-        else:
-            new_agent = TeachBackAgent()
-
-        # Return BOTH the new agent (handoff) and a small textual result
-        # (the text is visible to the LLM, the agent handoff is handled by LiveKit)
-        return new_agent, f"Switching to {mode} mode for concept '{concept_id}'."
-
-
-    @function_tool()
-    async def set_concept(
-        self,
-        context: RunContext,
-        concept_id: str,
-    ) -> str:
-        """
-        Set the active concept by id ('variables', 'loops', etc.).
-        Call when the user explicitly asks for a concept.
-        """
-        session = context.session
-        if concept_id not in TUTOR_BY_ID:
-            valid = ", ".join(TUTOR_BY_ID.keys())
-            return f"Unknown concept id '{concept_id}'. Valid ids: {valid}."
-
-        _set_tutor_concept(session, concept_id)
-        return f"Great, we'll focus on '{concept_id}' now."
-
-
-# ---------- Router agent (entrypoint) ---------- #
-
-class RouterAgent(BaseTutorAgent):
-    """
-    First agent the user meets.
-    Greets, explains modes, asks what they want, then hands off.
-    """
-
-    def __init__(self, **kwargs):
-        super().__init__(
-            mode="welcome",
-            tts=TTS_ROUTER,
-            extra_mode_instructions="""
-- Greet the learner.
-- Briefly describe the three modes: learn, quiz, teach_back.
-- Ask which mode they want to start with and which concept (e.g. 'variables' or 'loops').
-- After they reply, call `switch_mode` with their chosen mode and concept_id.
-- Once you call `switch_mode`, you don't continue talking; the new agent takes over.
-""",
-            **kwargs,
-        )
-
-    async def on_enter(self) -> None:
-        # Kick off the greeting turn
-        await self.session.generate_reply(
-            instructions=(
-                "Greet the learner. Explain that you have three modes: "
-                "learn (I explain), quiz (I question you), and teach_back (you explain). "
-                "Ask: which mode do you want to start with, and which concept — "
-                "variables or loops?"
-            )
-        )
-
-
-# ---------- Learn mode agent (Matthew) ---------- #
-
-class LearnAgent(BaseTutorAgent):
-    def __init__(self, **kwargs):
-        super().__init__(
-            mode="learn",
-            tts=TTS_MATTHEW,
-            extra_mode_instructions="""
-In learn mode:
-- Focus on the active concept from state.
-- Use that concept's `summary` as the backbone of your explanation.
-- Explain in clear, friendly language with 1–2 short, concrete examples.
-- After a short explanation, ask something like:
-  - "Want me to quiz you on this?"
-  - "Should we switch to teach-back so you explain it to me?"
-""",
-            **kwargs,
-        )
-
-    async def on_enter(self) -> None:
-        concept = _get_active_concept(self.session)
-        await self.session.generate_reply(
-            instructions=(
-                "Introduce yourself as the Learn mode tutor using Matthew's voice. "
-                f"Tell the learner you'll start with the concept '{concept['title']}'. "
-                "Give a short, high-level explanation of the concept and ask if "
-                "they want more detail or would like to be quizzed."
-            )
-        )
-
-
-# ---------- Quiz mode agent (Alicia) ---------- #
-
-class QuizAgent(BaseTutorAgent):
-    def __init__(self, **kwargs):
-        super().__init__(
-            mode="quiz",
-            tts=TTS_ALICIA,
-            extra_mode_instructions="""
-In quiz mode:
-- Ask ONE short question at a time, based on the concept's `sample_question`
-  and small variations of it.
-- Wait for the user's answer before giving feedback.
-- Feedback should be brief: what they got right, what they missed.
-- Then either:
-  - ask a follow-up question, or
-  - suggest switching to teach_back or learn if they seem unsure.
-""",
-            **kwargs,
-        )
-
-    async def on_enter(self) -> None:
-        concept = _get_active_concept(self.session)
-        await self.session.generate_reply(
-            instructions=(
-                "Introduce yourself as the Quiz mode tutor using Alicia's voice. "
-                f"Confirm you're quizzing them on '{concept['title']}'. "
-                "Ask one short question based on the concept's sample_question, "
-                "and wait for their answer."
-            )
-        )
-
-
-# ---------- Teach-back mode agent (Ken) ---------- #
-
-class TeachBackAgent(BaseTutorAgent):
-    def __init__(self, **kwargs):
-        super().__init__(
-            mode="teach_back",
-            tts=TTS_KEN,
-            extra_mode_instructions="""
-In teach_back mode:
-- Ask the learner to explain the concept in their own words.
-- Let them finish before responding.
-- Give 1–3 sentences of qualitative feedback:
-  - What they explained well.
-  - What they missed or could clarify.
-- Optionally suggest whether they should:
-  - go back to learn for more explanation, or
-  - keep quizzing.
-""",
-            **kwargs,
-        )
-
-    async def on_enter(self) -> None:
-        concept = _get_active_concept(self.session)
-        await self.session.generate_reply(
-            instructions=(
-                "Introduce yourself as the MurfLearn coach using Ken's voice. "
-                f"Ask the learner to explain '{concept['title']}' in their own words. "
-                "Encourage them to cover the main idea and at least one example."
-            )
-        )
-
-
-# ---------- Prewarm (VAD) ---------- #
+# ---------- Prewarm ---------- #
 
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
-
 
 # ---------- Entrypoint ---------- #
 
@@ -411,14 +363,13 @@ async def entrypoint(ctx: JobContext):
         llm=google.LLM(
             model="gemini-2.5-flash",
         ),
-        # Default TTS (router / fallback) – individual agents override this
-        tts=TTS_MATTHEW,
+        tts=TTS_GAME_MASTER,
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,
     )
 
-    # Initialize userdata; tutor state lives under session.userdata["tutor"]
+    # Initialize userdata; game state lives under session.userdata["game"]
     session.userdata = {}
 
     usage_collector = metrics.UsageCollector()
@@ -434,9 +385,9 @@ async def entrypoint(ctx: JobContext):
 
     ctx.add_shutdown_callback(log_usage)
 
-    # Start with RouterAgent → it will hand off to learn/quiz/teach_back
+    # Start with Game Master Agent (Fantasy universe by default)
     await session.start(
-        agent=RouterAgent(),
+        agent=GameMasterAgent(universe="fantasy"),
         room=ctx.room,
         room_input_options=RoomInputOptions(
             noise_cancellation=noise_cancellation.BVC(),
@@ -444,7 +395,6 @@ async def entrypoint(ctx: JobContext):
     )
 
     await ctx.connect()
-
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
